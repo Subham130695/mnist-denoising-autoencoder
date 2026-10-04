@@ -73,18 +73,19 @@ class ContractiveDense(layers.Layer):
 
 @st.cache_resource
 def load_model():
-    paths = glob.glob("models/*.keras")
+    paths = sorted(glob.glob("models/*.keras"))
     if not paths:
         st.error("No .keras model found in the models/ folder.")
         st.stop()
-    path = paths[0]
+    # prefer models/best_model.keras so the app never silently loads a different file
+    path = "models/best_model.keras" if "models/best_model.keras" in paths else paths[0]
     size_kb = os.path.getsize(path) / 1024
     if not zipfile.is_zipfile(path):
         st.error(f"{path} is not a valid .keras file (size: {size_kb:.1f} KB). "
                  "Re-export it from Colab and re-upload it.")
         st.stop()
     model = keras.models.load_model(path, compile=False)
-    name = model.name.replace("_", " ")                       # e.g. "Denoising AE"
+    name = model.name.replace("_", " ")                       # e.g. "Convolutional AE"
     kind = "img" if len(model.input_shape) == 4 else "flat"   # same logic as fmt() in the notebook
     return model, kind, name
 
@@ -98,9 +99,27 @@ def add_noise(x, nf, seed):
     return np.clip(x + nf * r.normal(0.0, 1.0, x.shape), 0.0, 1.0).astype("float32")
 
 
+def to_gray(pil_img):
+    """Grayscale; transparent PNGs are flattened onto a white background first."""
+    if pil_img.mode in ("RGBA", "LA") or (pil_img.mode == "P" and "transparency" in pil_img.info):
+        rgba = pil_img.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        pil_img = Image.alpha_composite(bg, rgba)
+    return pil_img.convert("L")
+
+
+def preprocess_noisy(pil_img):
+    """For images that are ALREADY noisy: only grayscale, resize to 28x28, invert if needed.
+    No thresholding or cropping, because that would remove/move the noise before the model sees it."""
+    x = np.asarray(to_gray(pil_img).resize((28, 28), Image.LANCZOS)).astype("float32") / 255.0
+    if x.mean() > 0.5:
+        x = 1.0 - x
+    return x
+
+
 def preprocess(pil_img):
     """MNIST-style preprocessing: invert, stretch contrast, crop, fit to 20x20, centre in 28x28."""
-    g = np.asarray(pil_img.convert("L")).astype("float32") / 255.0
+    g = np.asarray(to_gray(pil_img)).astype("float32") / 255.0
     if g.mean() > 0.5:                                  # dark ink on light paper -> invert
         g = 1.0 - g
     g = (g - g.min()) / (g.max() - g.min() + 1e-8)      # stretch contrast
@@ -108,7 +127,7 @@ def preprocess(pil_img):
 
     ys, xs = np.where(g > 0.2)
     if len(ys) == 0:                                    # nothing found -> plain resize
-        return np.asarray(pil_img.convert("L").resize((28, 28))).astype("float32") / 255.0
+        return np.asarray(to_gray(pil_img).resize((28, 28))).astype("float32") / 255.0
     crop = g[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
     h, w = crop.shape
@@ -145,13 +164,15 @@ with st.sidebar:
 
 # ---------------- Main page ----------------
 st.title(f"MNIST Autoencoder Denoising — {model_name}")
-st.write("Upload a handwritten digit image (28×28 grayscale works best). "
+st.write("Upload a handwritten digit image (any size; it is converted to a centred 28×28 MNIST-style digit). "
+         "If the image is already noisy, tick the box in the sidebar. "
          "The model deployed here was the best performer on the lab's PSNR results.")
 
 uploaded = st.file_uploader("Upload a digit image", type=["png", "jpg", "jpeg"])
 
 if uploaded is not None:
-    x = preprocess(Image.open(uploaded))
+    img = Image.open(uploaded)
+    x = preprocess_noisy(img) if is_noisy else preprocess(img)
 
     if not is_noisy:
         if "seed" not in st.session_state:
